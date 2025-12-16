@@ -4,6 +4,9 @@ the set of qualified website authentication certificate (QWAC) trust anchors, as
 Additionally, it can compare the set it comes up with against the set currently
 in Chrome.
 
+#Acknowledgement 
+Mostly written by Dana Keeler (https://github.com/mozkeeler) (Mozilla)
+
 ## Example Usage
 `$ cargo run -- -d tls -o download -o process -o compare --extension QWACS`
 
@@ -14,3 +17,4 @@ each list identified by that list (recursively). Downloaded artifacts are saved
 in the directory `tls`. Once downloaded, the lists are parsed and the set of
 QWAC trust anchors are saved in `tls/trust_anchors.pem`. Finally, Chrome's list
 is compared against the parsed set, with any differences printed out.
+
