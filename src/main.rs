@@ -1,6 +1,7 @@
 use base64::prelude::*;
 use chrono::{DateTime, Utc};
 use clap::{Parser, ValueEnum};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Error, ErrorKind, Read, Write};
@@ -16,6 +17,9 @@ struct Args {
 
     #[arg(long, short = 'o', required = true)]
     operations: Vec<Operation>,
+
+    #[arg(long = "extension", value_enum)]
+    extensions: Vec<ServiceExtension>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Eq, PartialEq)]
@@ -25,12 +29,57 @@ enum Operation {
     Compare,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Eq, PartialEq, Ord, PartialOrd)]
+enum ServiceExtension {
+    #[value(name = "QCForESig")]
+    QCForESig,
+    #[value(name = "ForeSignatures")]
+    ForeSignatures,
+    #[value(name = "ForeSeals")]
+    ForeSeals,
+    #[value(name = "QWACS")]
+    QWACS,
+    #[value(name = "QCForESeal")]
+    QCForESeal,
+}
+
+impl ServiceExtension {
+    fn uri(&self) -> &'static str {
+        match self {
+            ServiceExtension::QCForESig => {
+                "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/QCForESig"
+            }
+            ServiceExtension::ForeSignatures => {
+                "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSignatures"
+            }
+            ServiceExtension::ForeSeals => {
+                "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForeSeals"
+            }
+            ServiceExtension::QWACS => {
+                "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForWebSiteAuthentication"
+            }
+            ServiceExtension::QCForESeal => {
+                "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/QCForESeal"
+            }
+        }
+    }
+
+}
+
 static CHROMIUM_ADDITIONAL_CERTS: &'static str = "https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/data/ssl/chrome_root_store/additional.certs?format=TEXT";
 static CHROMIUM_ADDITIONAL_CERTS_FILENAME: &'static str = "chromium.additional.certs";
 static TRUST_ANCHORS_FILENAME: &'static str = "trust_anchors.pem";
 
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    let mut extension_filters = if args.extensions.is_empty() {
+        vec![ServiceExtension::QWACS]
+    } else {
+        args.extensions.clone()
+    };
+    extension_filters.sort();
+    extension_filters.dedup();
+    let extensions: BTreeSet<ServiceExtension> = extension_filters.into_iter().collect();
     if args.operations.contains(&Operation::Download) {
         download_if_not_cached(
             CHROMIUM_ADDITIONAL_CERTS,
@@ -40,7 +89,7 @@ fn main() -> std::io::Result<()> {
         download_lists_of_trust_lists(&args.dir)?;
     }
     if args.operations.contains(&Operation::Process) {
-        process_trust_lists(&args.dir)?;
+        process_trust_lists(&args.dir, &extensions)?;
     }
     if args.operations.contains(&Operation::Compare) {
         compare_results(&args.dir)?;
@@ -121,12 +170,12 @@ fn download_lists_of_trust_lists(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn process_trust_lists(dir: &Path) -> std::io::Result<()> {
+fn process_trust_lists(dir: &Path, extensions: &BTreeSet<ServiceExtension>) -> std::io::Result<()> {
     let mut trust_anchors_out = File::create(dir.join(TRUST_ANCHORS_FILENAME))?;
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
         if !path.is_dir() {
-            process_trust_list(&path, &mut trust_anchors_out)?;
+            process_trust_list(&path, &mut trust_anchors_out, extensions)?;
         }
     }
     Ok(())
@@ -447,23 +496,68 @@ impl TSPService {
         }
     }
 
-    fn is_qwacs(&self) -> bool {
-        let mut qwacs_statuses = vec![self.service_information.qwacs_status()];
-        if let Some(service_history) = self.service_history.as_ref() {
-            for service_history_instance in service_history.service_history_instances.iter() {
-                qwacs_statuses.push(service_history_instance.qwacs_status());
-            }
+    fn matches_extensions(&self, extensions: &BTreeSet<ServiceExtension>) -> bool {
+        extensions
+            .iter()
+            .copied()
+            .any(|extension| self.matches_extension(extension))
+    }
+
+    fn matches_extension(&self, extension: ServiceExtension) -> bool {
+        match extension {
+            ServiceExtension::QCForESig => self.is_qc_for_esig(),
+            ServiceExtension::ForeSignatures => self.is_fore_signatures(),
+            ServiceExtension::ForeSeals => self.is_fore_seals(),
+            ServiceExtension::QWACS => self.is_qwacs(),
+            ServiceExtension::QCForESeal => self.is_qc_for_e_seal(),
         }
-        let Some(most_recent_qwacs_status) =
-            qwacs_statuses.iter().max_by_key(|(_, timestamp)| timestamp)
+    }
+
+    fn evaluate_extension(&self, extension: ServiceExtension) -> bool {
+        let Some((status, _timestamp)) =
+            self.latest_status_for_extension(extension.uri())
         else {
             return false;
         };
-        match most_recent_qwacs_status {
-            (QWACsStatus::Granted, _) => true,
-            (QWACsStatus::Withdrawn, _) => false,
-            (QWACsStatus::Other, _) => false,
+        match status {
+            ExtensionStatus::Granted => true,
+            ExtensionStatus::Withdrawn => false,
+            ExtensionStatus::Other => false,
         }
+    }
+
+    fn latest_status_for_extension(
+        &self,
+        extension_uri: &str,
+    ) -> Option<(ExtensionStatus, DateTime<Utc>)> {
+        let mut statuses = Vec::new();
+        statuses.push(self.service_information.extension_status(extension_uri));
+        if let Some(service_history) = self.service_history.as_ref() {
+            for service_history_instance in service_history.service_history_instances.iter() {
+                statuses.push(service_history_instance.extension_status(extension_uri));
+            }
+        }
+        statuses.into_iter().max_by_key(|(_, timestamp)| *timestamp)
+    }
+
+    fn is_qc_for_esig(&self) -> bool {
+        self.evaluate_extension(ServiceExtension::QCForESig)
+    }
+
+    fn is_qwacs(&self) -> bool {
+        self.evaluate_extension(ServiceExtension::QWACS)
+    }
+
+    fn is_fore_signatures(&self) -> bool {
+        self.evaluate_extension(ServiceExtension::ForeSignatures)
+    }
+
+    fn is_fore_seals(&self) -> bool {
+        self.evaluate_extension(ServiceExtension::ForeSeals)
+    }
+
+    fn is_qc_for_e_seal(&self) -> bool {
+        self.evaluate_extension(ServiceExtension::QCForESeal)
     }
 }
 
@@ -569,12 +663,16 @@ impl ServiceHistoryInstance {
         }
     }
 
-    fn qwacs_status(&self) -> (QWACsStatus, DateTime<Utc>) {
-        QWACsStatus::from_service_information(
+    fn extension_status(
+        &self,
+        extension_uri: &str,
+    ) -> (ExtensionStatus, DateTime<Utc>) {
+        ExtensionStatus::from_service_information(
             &self.service_information_extensions,
             self.service_type_identifier.as_str(),
             self.service_status.as_str(),
             self.status_starting_time.as_str(),
+            extension_uri,
         )
     }
 }
@@ -589,49 +687,51 @@ struct ServiceInformation {
     status_starting_time: String,
 }
 
-enum QWACsStatus {
+#[derive(Debug, Clone, Copy)]
+enum ExtensionStatus {
     Granted,
     Withdrawn,
     Other,
 }
 
-impl QWACsStatus {
+impl ExtensionStatus {
     fn from_service_information(
         service_information_extensions: &Option<ServiceInformationExtensions>,
         service_type_identifier: &str,
         service_status: &str,
         status_starting_time: &str,
-    ) -> (QWACsStatus, DateTime<Utc>) {
+        extension_uri: &str,
+    ) -> (ExtensionStatus, DateTime<Utc>) {
         let timestamp = DateTime::parse_from_rfc3339(status_starting_time)
             .unwrap()
             .into();
         let Some(service_information_extensions) = service_information_extensions.as_ref() else {
-            return (QWACsStatus::Other, timestamp);
+            return (ExtensionStatus::Other, timestamp);
         };
         if service_information_extensions
             .extensions
             .iter()
             .find(|extension| {
-                extension
+                let uri = extension
                     .additional_service_information
                     .as_ref()
-                    .map_or("", |asi| asi.uri.as_str())
-                    == "http://uri.etsi.org/TrstSvc/TrustedList/SvcInfoExt/ForWebSiteAuthentication"
+                    .map_or("", |asi| asi.uri.as_str());
+                uri == extension_uri
             })
             .is_none()
         {
-            return (QWACsStatus::Other, timestamp);
+            return (ExtensionStatus::Other, timestamp);
         }
         if service_type_identifier != "http://uri.etsi.org/TrstSvc/Svctype/CA/QC" {
-            return (QWACsStatus::Other, timestamp);
+            return (ExtensionStatus::Other, timestamp);
         }
         if service_status == "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted" {
-            return (QWACsStatus::Granted, timestamp);
+            return (ExtensionStatus::Granted, timestamp);
         }
         if service_status == "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/withdrawn" {
-            return (QWACsStatus::Withdrawn, timestamp);
+            return (ExtensionStatus::Withdrawn, timestamp);
         }
-        (QWACsStatus::Granted, timestamp)
+        (ExtensionStatus::Other, timestamp)
     }
 }
 
@@ -704,12 +804,16 @@ impl ServiceInformation {
         }
     }
 
-    fn qwacs_status(&self) -> (QWACsStatus, DateTime<Utc>) {
-        QWACsStatus::from_service_information(
+    fn extension_status(
+        &self,
+        extension_uri: &str,
+    ) -> (ExtensionStatus, DateTime<Utc>) {
+        ExtensionStatus::from_service_information(
             &self.service_information_extensions,
             self.service_type_identifier.as_str(),
             self.service_status.as_str(),
             self.status_starting_time.as_str(),
+            extension_uri,
         )
     }
 }
@@ -952,7 +1056,11 @@ fn normalize_certificate(certificate: String) -> String {
     lines.join("\n")
 }
 
-fn process_trust_list(path: &Path, trust_anchors_out: &mut File) -> std::io::Result<()> {
+fn process_trust_list(
+    path: &Path,
+    trust_anchors_out: &mut File,
+    extensions: &BTreeSet<ServiceExtension>,
+) -> std::io::Result<()> {
     let trust_list_file = File::open(path)?;
     let trust_list_reader = BufReader::new(trust_list_file);
     let mut parser = EventReader::new(trust_list_reader);
@@ -1018,7 +1126,7 @@ fn process_trust_list(path: &Path, trust_anchors_out: &mut File) -> std::io::Res
             let _ = ski_to_certificate.insert(ski, certificate);
         }
         for tsp_service in trust_service_provider.tsp_services.iter() {
-            if tsp_service.is_qwacs() {
+            if tsp_service.matches_extensions(extensions) {
                 let service_name = tsp_service
                     .service_information
                     .service_name
@@ -1032,6 +1140,17 @@ fn process_trust_list(path: &Path, trust_anchors_out: &mut File) -> std::io::Res
                     .service_digital_identity
                     .certificate(&ski_to_certificate)
                     .unwrap();
+                let pem_body: String = certificate
+                    .lines()
+                    .filter(|line| !line.starts_with("-----"))
+                    .collect();
+                let der = BASE64_STANDARD
+                    .decode(pem_body)
+                    .map_err(|e| Error::new(ErrorKind::Other, e))?;
+                let digest = Sha256::digest(&der);
+                trust_anchors_out.write_all(
+                    format!("# crt.sh friendly hash (sha-256): {:x}\n", digest).as_bytes(),
+                )?;
                 trust_anchors_out.write_all(certificate.as_bytes())?;
                 trust_anchors_out.write_all("\n".as_bytes())?;
             }
