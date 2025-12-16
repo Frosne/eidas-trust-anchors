@@ -1,11 +1,13 @@
-# QWAC Trust Anchors
+# eIDAS Trust Anchors
 The purpose of this utility is to parse the EU list of trust lists and glean
-the set of qualified website authentication certificate (QWAC) trust anchors.
+the set of qualified website authentication certificate (QWAC) trust anchors, as well as the trust anchors used for signing and sealing.
 Additionally, it can compare the set it comes up with against the set currently
 in Chrome.
 
 ## Example Usage
-`$ cargo run -- -d tls -o download -o process -o compare`
+`$ cargo run -- -d tls -o download -o process -o compare --extension QWACS`
+
+To extract qualified signature anchors instead, specify the relevant extension (e.g. `--extension QCForESig` or `--extension ForeSignatures`).
 
 This will download the set of anchors in Chrome, the list of trust lists, and
 each list identified by that list (recursively). Downloaded artifacts are saved
