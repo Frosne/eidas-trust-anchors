@@ -4,7 +4,7 @@ the set of qualified website authentication certificate (QWAC) trust anchors, as
 Additionally, it can compare the set it comes up with against the set currently
 in Chrome.
 
-#Acknowledgement 
+# Acknowledgement 
 Mostly written by Dana Keeler (https://github.com/mozkeeler) (Mozilla)
 
 ## Example Usage
