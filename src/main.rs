@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{BufReader, Error, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use xml::EventReader;
 use xml::reader::XmlEvent;
 
@@ -63,7 +64,6 @@ impl ServiceExtension {
             }
         }
     }
-
 }
 
 static CHROMIUM_ADDITIONAL_CERTS: &'static str = "https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/data/ssl/chrome_root_store/additional.certs?format=TEXT";
@@ -114,39 +114,83 @@ fn download_if_not_cached(uri: &str, filename: String, dir: &Path) -> std::io::R
         return Ok(());
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    let result = client
-        .get(uri)
-        .send()
-        .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    let contents = result
-        .bytes()
-        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+    let contents = match download_with_reqwest(uri) {
+        Ok(bytes) => bytes,
+        Err(primary_err) => {
+            eprintln!(
+                "reqwest download failed for {}: {} - trying curl fallback",
+                uri, primary_err
+            );
+            match download_with_curl(uri) {
+                Ok(bytes) => bytes,
+                Err(curl_err) => {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!(
+                            "primary download failed: {}; curl fallback failed: {}",
+                            primary_err, curl_err
+                        ),
+                    ));
+                }
+            }
+        }
+    };
     eprintln!("saving to {}...", path.display());
     let mut file = std::fs::File::create(path)?;
     file.write_all(&contents)?;
     Ok(())
 }
 
+fn download_with_reqwest(uri: &str) -> std::io::Result<Vec<u8>> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+    let response = client
+        .get(uri)
+        .send()
+        .map_err(|e| Error::new(ErrorKind::Other, e))?
+        .error_for_status()
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+    response
+        .bytes()
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| Error::new(ErrorKind::Other, e))
+}
+
+fn download_with_curl(uri: &str) -> std::io::Result<Vec<u8>> {
+    let output = Command::new("curl")
+        .args(["-k", "-sSL", "-A", USER_AGENT, uri])
+        .output()
+        .map_err(|e| Error::new(ErrorKind::Other, e))?;
+    if !output.status.success() {
+        return Err(Error::new(
+            ErrorKind::Other,
+            format!("curl exited with status {}", output.status),
+        ));
+    }
+    Ok(output.stdout)
+}
+
 fn download_lists_of_trust_lists(dir: &Path) -> std::io::Result<()> {
     let root = "https://ec.europa.eu/tools/lotl/eu-lotl.xml".to_string();
     let mut processed: BTreeSet<String> = BTreeSet::new();
     let mut list_of_trust_lists = vec![root];
+    let mut succeeded = 0usize;
+    let mut failed = 0usize;
+    let mut pointer_total = 0usize;
     while let Some(trust_list) = list_of_trust_lists.pop() {
-        if download_if_not_cached(
+        if let Err(err) = download_if_not_cached(
             trust_list.as_str(),
             uri_to_filename(trust_list.as_str()),
             dir,
-        )
-        .is_err()
-        {
-            eprintln!("error - skipping {}", trust_list);
+        ) {
+            eprintln!("error downloading {}: {} - skipping", trust_list, err);
+            failed += 1;
             continue;
         }
+        succeeded += 1;
         let path = dir.join(uri_to_filename(trust_list.as_str()));
         let trust_list_file = File::open(path)?;
         let trust_list_reader = BufReader::new(trust_list_file);
@@ -154,6 +198,9 @@ fn download_lists_of_trust_lists(dir: &Path) -> std::io::Result<()> {
         let Ok(trust_service_status_list) = TrustServiceStatusList::from_xml(&mut parser) else {
             continue;
         };
+        pointer_total = trust_service_status_list
+            .scheme_information
+            .other_tsl_pointer_count;
         for other_tsl_pointer in trust_service_status_list
             .scheme_information
             .pointers_to_other_tsl
@@ -167,6 +214,10 @@ fn download_lists_of_trust_lists(dir: &Path) -> std::io::Result<()> {
         }
         processed.insert(trust_list);
     }
+    eprintln!(
+        "found {} trusted list pointer(s); downloaded {} trust list(s), {} error(s)",
+        pointer_total, succeeded, failed
+    );
     Ok(())
 }
 
@@ -272,6 +323,7 @@ impl TrustServiceStatusList {
 
 #[derive(Debug)]
 struct SchemeInformation {
+    other_tsl_pointer_count: usize,
     pointers_to_other_tsl: PointersToOtherTSL,
 }
 
@@ -314,6 +366,10 @@ impl SchemeInformation {
                 Ok(XmlEvent::EndElement { name }) => {
                     assert!(name.local_name.as_str() == "SchemeInformation");
                     return SchemeInformation {
+                        other_tsl_pointer_count: pointers_to_other_tsl
+                            .as_ref()
+                            .map(|p| p.other_tsl_pointers.len())
+                            .unwrap_or(0),
                         pointers_to_other_tsl: pointers_to_other_tsl.unwrap(),
                     };
                 }
@@ -514,9 +570,7 @@ impl TSPService {
     }
 
     fn evaluate_extension(&self, extension: ServiceExtension) -> bool {
-        let Some((status, _timestamp)) =
-            self.latest_status_for_extension(extension.uri())
-        else {
+        let Some((status, _timestamp)) = self.latest_status_for_extension(extension.uri()) else {
             return false;
         };
         match status {
@@ -541,7 +595,10 @@ impl TSPService {
     }
 
     fn is_qc_for_esig(&self) -> bool {
-        self.evaluate_extension(ServiceExtension::QCForESig)
+        if self.evaluate_extension(ServiceExtension::QCForESig) {
+            return true;
+        }
+        self.evaluate_extension(ServiceExtension::ForeSignatures)
     }
 
     fn is_qwacs(&self) -> bool {
@@ -557,7 +614,10 @@ impl TSPService {
     }
 
     fn is_qc_for_e_seal(&self) -> bool {
-        self.evaluate_extension(ServiceExtension::QCForESeal)
+        if self.evaluate_extension(ServiceExtension::QCForESeal) {
+            return true;
+        }
+        self.evaluate_extension(ServiceExtension::ForeSeals)
     }
 }
 
@@ -663,10 +723,7 @@ impl ServiceHistoryInstance {
         }
     }
 
-    fn extension_status(
-        &self,
-        extension_uri: &str,
-    ) -> (ExtensionStatus, DateTime<Utc>) {
+    fn extension_status(&self, extension_uri: &str) -> (ExtensionStatus, DateTime<Utc>) {
         ExtensionStatus::from_service_information(
             &self.service_information_extensions,
             self.service_type_identifier.as_str(),
@@ -708,17 +765,10 @@ impl ExtensionStatus {
         let Some(service_information_extensions) = service_information_extensions.as_ref() else {
             return (ExtensionStatus::Other, timestamp);
         };
-        if service_information_extensions
+        if !service_information_extensions
             .extensions
             .iter()
-            .find(|extension| {
-                let uri = extension
-                    .additional_service_information
-                    .as_ref()
-                    .map_or("", |asi| asi.uri.as_str());
-                uri == extension_uri
-            })
-            .is_none()
+            .any(|extension| extension.contains_extension_uri(extension_uri))
         {
             return (ExtensionStatus::Other, timestamp);
         }
@@ -804,10 +854,7 @@ impl ServiceInformation {
         }
     }
 
-    fn extension_status(
-        &self,
-        extension_uri: &str,
-    ) -> (ExtensionStatus, DateTime<Utc>) {
+    fn extension_status(&self, extension_uri: &str) -> (ExtensionStatus, DateTime<Utc>) {
         ExtensionStatus::from_service_information(
             &self.service_information_extensions,
             self.service_type_identifier.as_str(),
@@ -940,11 +987,13 @@ impl ServiceInformationExtensions {
 #[derive(Debug)]
 struct Extension {
     additional_service_information: Option<AdditionalServiceInformation>,
+    qualifier_uris: Vec<String>,
 }
 
 impl Extension {
     fn from_xml<R: Read>(parser: &mut EventReader<R>) -> Extension {
         let mut additional_service_information = None;
+        let mut qualifier_uris = Vec::new();
         loop {
             match parser.next() {
                 Ok(XmlEvent::StartElement { name, .. }) => {
@@ -955,7 +1004,10 @@ impl Extension {
                                 .replace(AdditionalServiceInformation::from_xml(parser));
                             assert!(replaced.is_none());
                         }
-                        "Qualifications" => ignore(parser, "Qualifications"),
+                        "Qualifications" => {
+                            let quals = Qualifications::from_xml(parser);
+                            qualifier_uris.extend(quals.qualifier_uris);
+                        }
                         "TakenOverBy" => ignore(parser, "TakenOverBy"),
                         "URLContentTypeAndAuthorizedServiceList" => {
                             ignore(parser, "URLContentTypeAndAuthorizedServiceList")
@@ -970,11 +1022,113 @@ impl Extension {
                     assert!(name.local_name.as_str() == "Extension");
                     return Extension {
                         additional_service_information,
+                        qualifier_uris,
                     };
                 }
                 Ok(_) => {}
                 Err(e) => panic!("error: {}", e),
             }
+        }
+    }
+
+    fn contains_extension_uri(&self, extension_uri: &str) -> bool {
+        self.additional_service_information
+            .as_ref()
+            .map_or(false, |asi| asi.uri.as_str() == extension_uri)
+            || self
+                .qualifier_uris
+                .iter()
+                .any(|uri| uri.as_str() == extension_uri)
+    }
+}
+
+#[derive(Debug)]
+struct Qualifications {
+    qualifier_uris: Vec<String>,
+}
+
+impl Qualifications {
+    fn from_xml<R: Read>(parser: &mut EventReader<R>) -> Qualifications {
+        let mut qualifier_uris = Vec::new();
+        loop {
+            match parser.next() {
+                Ok(XmlEvent::StartElement { name, .. }) => {
+                    let tag = name.local_name.as_str();
+                    match tag {
+                        "QualificationElement" => {
+                            let element = QualificationElement::from_xml(parser);
+                            qualifier_uris.extend(element.qualifier_uris);
+                        }
+                        _ => ignore(parser, tag),
+                    }
+                }
+                Ok(XmlEvent::EndElement { name }) => {
+                    assert!(name.local_name.as_str() == "Qualifications");
+                    return Qualifications { qualifier_uris };
+                }
+                Ok(_) => {}
+                Err(e) => panic!("error: {}", e),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QualificationElement {
+    qualifier_uris: Vec<String>,
+}
+
+impl QualificationElement {
+    fn from_xml<R: Read>(parser: &mut EventReader<R>) -> QualificationElement {
+        let mut qualifier_uris = Vec::new();
+        loop {
+            match parser.next() {
+                Ok(XmlEvent::StartElement { name, .. }) => {
+                    let tag = name.local_name.as_str();
+                    match tag {
+                        "Qualifiers" => qualifier_uris.extend(read_qualifiers(parser)),
+                        _ => ignore(parser, tag),
+                    }
+                }
+                Ok(XmlEvent::EndElement { name }) => {
+                    assert!(name.local_name.as_str() == "QualificationElement");
+                    return QualificationElement { qualifier_uris };
+                }
+                Ok(_) => {}
+                Err(e) => panic!("error: {}", e),
+            }
+        }
+    }
+}
+
+fn read_qualifiers<R: Read>(parser: &mut EventReader<R>) -> Vec<String> {
+    let mut qualifier_uris = Vec::new();
+    loop {
+        match parser.next() {
+            Ok(XmlEvent::StartElement {
+                name, attributes, ..
+            }) => {
+                let tag = name.local_name.as_str();
+                match tag {
+                    "Qualifier" => {
+                        if let Some(uri_attr) = attributes
+                            .iter()
+                            .find(|attr| attr.name.local_name.as_str() == "uri")
+                        {
+                            qualifier_uris.push(uri_attr.value.clone());
+                        }
+                        ignore(parser, tag);
+                    }
+                    _ => ignore(parser, tag),
+                }
+            }
+            Ok(XmlEvent::EndElement { name }) => {
+                assert!(name.local_name.as_str() == "Qualifiers");
+                return qualifier_uris;
+            }
+            Ok(XmlEvent::Characters(_)) => {}
+            Ok(_) => {}
+            Err(e) => panic!("error: {}", e),
         }
     }
 }
